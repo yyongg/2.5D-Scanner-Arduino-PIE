@@ -1,0 +1,12 @@
+# Python virtual environment
+.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Hardware tests
+hardware_test/
+
+# Scan output
+python/scans/

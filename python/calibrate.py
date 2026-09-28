@@ -1,13 +1,11 @@
-"""Calibrate the Sharp IR sensor, then verify the fit on new distances.
+"""Calibrate the IR sensor.
 
-Usage:
-    python calibrate.py                 # collect calibration points + fit
-    python calibrate.py --verify        # test the saved fit at NEW distances
-    python calibrate.py --fit-only      # refit from calibration_points.csv (no Arduino needed)
+  python calibrate.py            measure known distances and fit a curve
+  python calibrate.py --verify   check the fit at NEW distances
 
-Procedure: point the sensor (servos at home) at a flat, matte target (a sheet
-of cardboard works). Place it at a measured distance from the SENSOR FACE,
-type that distance, press Enter; repeat every 10 cm from 20 to 150 cm.
+Point the sensor at a flat target, type the distance from the sensor face in cm,
+press Enter. Repeat for about 8-10 distances between 20 and 150 cm.
+Press Enter on an empty line to finish.
 """
 import argparse
 import csv
@@ -16,112 +14,71 @@ import json
 import numpy as np
 import matplotlib.pyplot as plt
 
-from scanner_common import (CALIBRATION_FILE, HERE, command, connect,
-                            fit_calibration, load_calibration, raw_to_cm)
-
-POINTS_FILE = HERE / "calibration_points.csv"
-SAMPLES = 25   # ~1 s of readings per distance, median taken on the Arduino
+from scanner_common import (CALIBRATION_FILE, HERE, PAN_HOME, TILT_HOME,
+                            command, connect, load_calibration, raw_to_cm)
 
 
-def read_raw(ser):
-    return int(command(ser, f"R {SAMPLES}", "RAW").split()[1])
-
-
-def collect(ser):
-    pts = []
-    print("\nEnter the distance in cm (blank line to finish).")
+def measure(ser):
+    """Ask for distances and read the sensor at each one."""
+    points = []
     while True:
-        s = input("distance cm> ").strip()
-        if not s:
-            break
-        try:
-            d = float(s)
-        except ValueError:
-            print("  not a number"); continue
-        raw = read_raw(ser)
+        text = input("distance in cm (Enter to finish): ").strip()
+        if not text:
+            return points
+        raw = int(command(ser, "R 25").split()[1])   # median of 25 readings
         print(f"  raw = {raw}")
-        pts.append((d, raw))
-    return pts
+        points.append((float(text), raw))
 
 
-def save_points(pts):
-    with open(POINTS_FILE, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["distance_cm", "raw"])
-        w.writerows(pts)
-    print(f"Saved {len(pts)} points to {POINTS_FILE.name}")
+def calibrate(ser):
+    points = measure(ser)
+    d = np.array([p[0] for p in points])
+    raw = np.array([p[1] for p in points])
 
-
-def load_points():
-    with open(POINTS_FILE) as f:
-        r = csv.DictReader(f)
-        return [(float(row["distance_cm"]), int(row["raw"])) for row in r]
-
-
-def fit_and_plot(pts):
-    d = np.array([p[0] for p in pts]); raw = np.array([p[1] for p in pts])
-    valid = d >= 20   # below ~20 cm the sensor output folds back - exclude
-    cal = fit_calibration(d[valid], raw[valid])
+    # Fit a straight line in log-log space: log(d) = b*log(raw) + log(a)
+    b, log_a = np.polyfit(np.log(raw), np.log(d), 1)
+    cal = {"a": float(np.exp(log_a)), "b": float(b)}
     CALIBRATION_FILE.write_text(json.dumps(cal, indent=2))
-    pred = raw_to_cm(raw[valid], cal)
-    rmse = float(np.sqrt(np.mean((pred - d[valid]) ** 2)))
-    print(f"\nFit: distance_cm = {cal['a']:.1f} * raw^{cal['b']:.3f}   (RMSE {rmse:.2f} cm)")
-    print(f"Saved to {CALIBRATION_FILE.name}")
+    print(f"distance = {cal['a']:.0f} * raw^{b:.3f}   (saved to calibration.json)")
 
-    rr = np.linspace(raw[valid].min() * 0.9, raw[valid].max() * 1.05, 200)
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.scatter(raw[valid], d[valid], color="#2a6fdb", label="calibration points", zorder=3)
-    if (~valid).any():
-        ax.scatter(raw[~valid], d[~valid], color="#999", marker="x", label="excluded (<20 cm)")
-    ax.plot(rr, raw_to_cm(rr, cal), color="#e0572b", label=f"fit: {cal['a']:.0f}·raw^{cal['b']:.2f}")
-    ax.set_xlabel("Raw analog reading (0-1023)"); ax.set_ylabel("Distance (cm)")
-    ax.set_title(f"IR sensor calibration  (RMSE {rmse:.2f} cm)")
-    ax.grid(alpha=0.3); ax.legend()
-    fig.tight_layout(); fig.savefig(HERE / "calibration_fit.png", dpi=150)
-    print("Plot saved to calibration_fit.png")
+    with open(HERE / "calibration_points.csv", "w", newline="") as f:
+        csv.writer(f).writerows([("distance_cm", "raw")] + points)
+
+    curve = np.linspace(raw.min(), raw.max(), 200)
+    plt.scatter(raw, d, label="measured")
+    plt.plot(curve, raw_to_cm(curve, cal), "r", label="fit")
+    plt.xlabel("raw reading (0-1023)")
+    plt.ylabel("distance (cm)")
+    plt.title("IR sensor calibration")
+    plt.legend()
+    plt.savefig(HERE / "calibration_fit.png", dpi=150)
     plt.show()
 
 
 def verify(ser):
     cal = load_calibration()
-    rows = []
-    print("\nVERIFY: use distances you did NOT calibrate at (e.g. 25, 45, 75, 115 cm).")
+    rows = [("actual_cm", "raw", "predicted_cm", "error_cm")]
     while True:
-        s = input("actual distance cm> ").strip()
-        if not s:
+        text = input("actual distance in cm (Enter to finish): ").strip()
+        if not text:
             break
-        actual = float(s)
-        raw = read_raw(ser)
-        pred = float(raw_to_cm(raw, cal))
-        err = pred - actual
-        rows.append((actual, raw, pred, err))
-        print(f"  raw {raw} -> predicted {pred:.1f} cm   error {err:+.1f} cm ({100*err/actual:+.1f}%)")
-    if rows:
-        errs = np.array([r[3] for r in rows])
-        print(f"\nMean abs error {np.mean(np.abs(errs)):.2f} cm, max {np.max(np.abs(errs)):.2f} cm")
-        with open(HERE / "calibration_verify.csv", "w", newline="") as f:
-            w = csv.writer(f); w.writerow(["actual_cm", "raw", "predicted_cm", "error_cm"]); w.writerows(rows)
-        print("Saved calibration_verify.csv")
+        actual = float(text)
+        raw = int(command(ser, "R 25").split()[1])
+        predicted = float(raw_to_cm(raw, cal))
+        print(f"  predicted {predicted:.1f} cm, error {predicted - actual:+.1f} cm")
+        rows.append((actual, raw, round(predicted, 1), round(predicted - actual, 1)))
+
+    with open(HERE / "calibration_verify.csv", "w", newline="") as f:
+        csv.writer(f).writerows(rows)
+    print("Saved calibration_verify.csv")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port")
     ap.add_argument("--verify", action="store_true")
-    ap.add_argument("--fit-only", action="store_true")
+    ap.add_argument("--port")
     args = ap.parse_args()
 
-    if args.fit_only:
-        fit_and_plot(load_points())
-    else:
-        ser = connect(args.port)
-        command(ser, "G 90 90", "OK")
-        if args.verify:
-            verify(ser)
-        else:
-            pts = collect(ser)
-            if len(pts) < 4:
-                raise SystemExit("Need at least 4 points for a sensible fit.")
-            save_points(pts)
-            fit_and_plot(pts)
-        ser.close()
+    ser = connect(args.port)
+    command(ser, f"G {PAN_HOME} {TILT_HOME}")   # point straight ahead
+    verify(ser) if args.verify else calibrate(ser)

@@ -1,121 +1,100 @@
-"""Turn a scan CSV into pictures of the shape.
-A single-tilt-row scan instead gets the recommended 2D top-down plot.
+"""Plot a scan.
+
+  python visualize.py scans/smiley_20260928_120000.csv
+  python visualize.py scans/smiley_20260928_120000.csv --threshold 60
+
+A one-row scan gives a top-down view. A full scan gives a front view of the
+shape. The plot is also saved as a PNG next to the CSV.
 """
 import argparse
 from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
 
-from scanner_common import load_calibration, ray_dirs, raw_to_cm, read_scan_csv, to_xyz
-
-VALID_CM = (15, 200)   # anything outside this is noise / no return
-
-
-def otsu_threshold(values, bins=64):
-    """Pick the depth that best separates two groups (shape vs wall)."""
-    hist, edges = np.histogram(values, bins=bins)
-    centers = (edges[:-1] + edges[1:]) / 2
-    w0 = np.cumsum(hist); w1 = w0[-1] - w0
-    m0 = np.cumsum(hist * centers) / np.maximum(w0, 1)
-    m1 = (np.sum(hist * centers) - np.cumsum(hist * centers)) / np.maximum(w1, 1)
-    between = w0 * w1 * (m0 - m1) ** 2
-    return float(centers[np.argmax(between)])
+from scanner_common import (PAN_HOME, PAN_SIGN, TILT_HOME, TILT_SIGN,
+                            load_calibration, raw_to_cm, read_scan, to_xyz)
 
 
-def load(path):
-    cal = load_calibration()
-    pan, tilt, raw = read_scan_csv(path)
-    dist = raw_to_cm(raw, cal)
-    valid = (dist > VALID_CM[0]) & (dist < VALID_CM[1])
-    x, y, z = to_xyz(pan, tilt, dist)
-    return dict(pan=pan, tilt=tilt, raw=raw, dist=dist, x=x, y=y, z=z, valid=valid)
+def otsu(values):
+    """Find the depth that best splits the points into two groups (shape and wall).
+    It tries many cut-offs and keeps the one where the two groups are most separated."""
+    best, best_score = values.min(), 0
+    for cut in np.linspace(values.min(), values.max(), 200):
+        near, far = values[values < cut], values[values >= cut]
+        if len(near) and len(far):
+            score = len(near) * len(far) * (near.mean() - far.mean()) ** 2
+            if score > best_score:
+                best, best_score = cut, score
+    return best
 
 
-def plot_row(s, title):
-    """Single tilt row -> 2D top-down view (the 'recommended' sanity check)."""
-    v = s["valid"]
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 4.8))
-    a1.plot(s["pan"][v], s["dist"][v], "o-", ms=3, color="#2a6fdb")
-    a1.set_xlabel("Pan servo angle (deg)"); a1.set_ylabel("Distance (cm)")
-    a1.set_title("Distance vs pan angle"); a1.grid(alpha=0.3)
-    a2.scatter(s["x"][v], s["z"][v], s=12, c=s["z"][v], cmap="viridis_r")
-    a2.plot(0, 0, "r^", ms=10, label="scanner")
-    a2.set_xlabel("x, left/right (cm)"); a2.set_ylabel("z, distance ahead (cm)")
-    a2.set_title("Top-down view"); a2.set_aspect("equal"); a2.grid(alpha=0.3); a2.legend()
-    fig.suptitle(title)
+def plot_row(pan, dist, x, z):
+    """One row: distance vs angle, and a top-down map."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    ax1.plot(pan, dist, "o-")
+    ax1.set(xlabel="pan servo angle (deg)", ylabel="distance (cm)", title="Distance vs pan angle")
+    ax2.scatter(x, z, s=10)
+    ax2.plot(0, 0, "r^", label="scanner")
+    ax2.set(xlabel="x (cm)", ylabel="z, distance ahead (cm)", title="Top-down view")
+    ax2.set_aspect("equal")
+    ax2.legend()
     return fig
 
 
-def plot_full(s, title, threshold=None):
-    v = s["valid"]
-    x, y, z = s["x"][v], s["y"][v], s["z"][v]
-    thr = threshold if threshold is not None else otsu_threshold(z)
-    near = z < thr
+def plot_full(pan, tilt, z, threshold):
+    """Full scan: front view coloured by depth, shape/wall split, and histogram."""
+    # Arrange depths into a grid: one row per tilt angle, one column per pan angle
+    pans, tilts = np.unique(pan), np.unique(tilt)
+    grid = np.full((len(tilts), len(pans)), np.nan)
+    grid[np.searchsorted(tilts, tilt), np.searchsorted(pans, pan)] = z
+    if PAN_SIGN < 0:
+        grid = grid[:, ::-1]
+    if TILT_SIGN < 0:
+        grid = grid[::-1, :]
 
-    # marker size scaled to point spacing so the front view looks solid
-    # Front views: put every scan point on a regular (pan, tilt) grid and project
-    # each ray onto the plane of the shape, so the image is sized in real cm.
-    plane = float(np.percentile(z[near], 20)) if near.any() else float(np.median(z))
-    pans, tilts = np.unique(s["pan"]), np.unique(s["tilt"])
-    Z = np.full((len(tilts), len(pans)), np.nan)
-    zi = np.where(s["valid"], s["z"], np.nan)
-    Z[np.searchsorted(tilts, s["tilt"]), np.searchsorted(pans, s["pan"])] = zi
-    P, T = np.meshgrid(pans, tilts)
-    ux, uy, uz = ray_dirs(P, T)
-    GX, GY = plane * ux / uz, plane * uy / uz             # where each ray meets the shape plane
+    # Convert the angle range to cm on the shape (distance * tan(angle))
+    shape_dist = np.nanmedian(z[z < threshold])
+    x_cm = shape_dist * np.tan(np.radians(np.sort(PAN_SIGN * (pans - PAN_HOME))))
+    y_cm = shape_dist * np.tan(np.radians(np.sort(TILT_SIGN * (tilts - TILT_HOME))))
+    extent = [x_cm[0], x_cm[-1], y_cm[0], y_cm[-1]]
 
-    fig = plt.figure(figsize=(13, 10))
-    ax1 = fig.add_subplot(2, 2, 1)
-    m = ax1.pcolormesh(GX, GY, Z, cmap="viridis_r", shading="nearest")
-    fig.colorbar(m, ax=ax1, label="depth z (cm)")
-    ax1.set_title("Front view, coloured by depth"); ax1.set_aspect("equal")
-    ax1.set_xlabel(f"x on shape plane (cm, plane at {plane:.0f} cm)"); ax1.set_ylabel("y (cm)")
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(17, 5))
+    img = ax1.imshow(grid, origin="lower", extent=extent, cmap="viridis_r")
+    fig.colorbar(img, ax=ax1, label="depth (cm)")
+    ax1.set(xlabel="x (cm)", ylabel="y (cm)", title="Front view, coloured by depth")
 
-    ax2 = fig.add_subplot(2, 2, 2)
-    mask = np.where(np.isnan(Z), np.nan, (Z < thr).astype(float))
-    ax2.pcolormesh(GX, GY, mask, cmap=plt.matplotlib.colors.ListedColormap(["#e6e6e6", "#e0572b"]),
-                   shading="nearest", vmin=0, vmax=1)
-    ax2.set_title(f"Segmented: orange = shape (closer than {thr:.1f} cm)"); ax2.set_aspect("equal")
-    ax2.set_xlabel("x on shape plane (cm)"); ax2.set_ylabel("y (cm)")
+    is_shape = np.where(np.isnan(grid), np.nan, grid < threshold)
+    gray_orange = ListedColormap(["lightgray", "orangered"])   # wall = gray, shape = orange
+    ax2.imshow(is_shape, origin="lower", extent=extent, cmap=gray_orange, vmin=0, vmax=1)
+    ax2.set(xlabel="x (cm)", ylabel="y (cm)", title=f"Shape = closer than {threshold:.0f} cm")
 
-    ax3 = fig.add_subplot(2, 2, 3, projection="3d")
-    ax3.scatter(x, z, y, c=z, cmap="viridis_r", s=4)
-    ax3.scatter([0], [0], [0], c="red", marker="^", s=60)
-    ax3.set_xlabel("x (cm)"); ax3.set_ylabel("z depth (cm)"); ax3.set_zlabel("y (cm)")
-    ax3.set_title("3D point cloud (scanner = red)"); ax3.view_init(elev=15, azim=-70)
-
-    ax4 = fig.add_subplot(2, 2, 4)
-    ax4.hist(z, bins=60, color="#2a6fdb")
-    ax4.axvline(thr, color="#e0572b", lw=2, label=f"threshold {thr:.1f} cm")
-    ax4.set_xlabel("depth z (cm)"); ax4.set_ylabel("points"); ax4.legend()
-    ax4.set_title("Depth histogram: left peak = shape, right peak = wall")
-
-    fig.suptitle(title, fontsize=13)
-    fig.tight_layout()
-    n_shape = int(near.sum())
-    print(f"{len(z)} valid points, {n_shape} on shape, {len(z)-n_shape} on wall, threshold {thr:.1f} cm")
+    ax3.hist(z[~np.isnan(z)], bins=50)
+    ax3.axvline(threshold, color="r", label=f"threshold {threshold:.0f} cm")
+    ax3.set(xlabel="depth (cm)", ylabel="points", title="Depths: shape peak and wall peak")
+    ax3.legend()
     return fig
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("csv")
-    ap.add_argument("--threshold", type=float, help="depth (cm) splitting shape from wall; auto if omitted")
-    ap.add_argument("--no-show", action="store_true")
-    args = ap.parse_args()
+ap = argparse.ArgumentParser()
+ap.add_argument("csv")
+ap.add_argument("--threshold", type=float, help="depth in cm that splits shape from wall")
+args = ap.parse_args()
 
-    path = Path(args.csv)
-    s = load(path)
-    print(f"Loaded {len(s['raw'])} points ({(~s['valid']).sum()} out of range) from {path.name}")
-    single_row = len(np.unique(s["tilt"])) == 1
-    fig = plot_row(s, path.stem) if single_row else plot_full(s, path.stem, args.threshold)
-    out = path.with_suffix(".png")
-    fig.savefig(out, dpi=150)
-    print(f"Saved {out}")
-    if not args.no_show:
-        plt.show()
+pan, tilt, raw = read_scan(args.csv)
+dist = raw_to_cm(raw, load_calibration())
+dist[(dist < 20) | (dist > 150)] = np.nan   # sensor only works from 20 to 150 cm
+x, y, z = to_xyz(pan, tilt, dist)
 
+if len(np.unique(tilt)) == 1:
+    fig = plot_row(pan, dist, x, z)
+else:
+    valid_z = z[~np.isnan(z)]
+    threshold = args.threshold or otsu(valid_z)
+    fig = plot_full(pan, tilt, z, threshold)
 
-if __name__ == "__main__":
-    main()
+fig.suptitle(Path(args.csv).stem)
+fig.tight_layout()
+fig.savefig(Path(args.csv).with_suffix(".png"), dpi=150)
+plt.show()
